@@ -11,6 +11,8 @@ Public Sub TEST_FillTimesheetForPeriod(ID_Период As Long, StartDate As Dat
     Dim hoursValue As String
     Dim hoursKode As String
 
+On Error GoTo ErrorHandler
+
     If ID_Период < 1 Then
         ID_Период = Nz(DLookup("ID_Период", "тПЕРИОД_ТАБЕЛЯ", _
                       "Год_Период = " & Year(StartDate) & _
@@ -50,7 +52,7 @@ Public Sub TEST_FillTimesheetForPeriod(ID_Период As Long, StartDate As Dat
             "WHERE Начало_БЛ <= #" & Format(EndDate, "mm/dd/yyyy") & "# " & _
             "AND Окончание_БЛ >= #" & Format(StartDate, "mm/dd/yyyy") & "#"
 
-    Set rsAbsenceAll = db.OpenRecordset(sql, dbOpenSnapshot)  ' #############                 ВСЕ ОТПУСКА И
+    Set rsAbsenceAll = db.OpenRecordset(sql, dbOpenSnapshot)  ' #############                 ВСЕ ОТПУСКА И БОЛЬНИЧНЫЕ
     
 ' 0. До всех циклов — ПРАЗДНИКИ в Dictionary (чтобы убить DCount)
     Dim dictAnnual As Object
@@ -72,12 +74,35 @@ Public Sub TEST_FillTimesheetForPeriod(ID_Период As Long, StartDate As Dat
         End If
         rs.MoveNext
     Loop
-    rs.Close    
+    rs.Close
+        
+    Dim dictManual As Object
+    Set dictManual = CreateObject("Scripting.Dictionary")
+    Dim rsManual As DAO.Recordset
+    Dim manualKey As String
+    
+' 11 Загружаем только записи с флагом РучноеИзменение за нужный период
+    sql = "SELECT ID_Персонал, Дата_Табель FROM тТАБЕЛЬ " & _
+          "WHERE ID_Период = " & ID_Период & " AND Nz(РучноеИзменение, False) = True"
+    Set rsManual = db.OpenRecordset(sql, dbOpenSnapshot)
+    Do Until rsManual.EOF
+        ' Создаем уникальный ключ: "ID-Дата"
+        manualKey = rsManual!ID_Персонал & "-" & Format(rsManual!Дата_Табель, "yyyy-mm-dd")
+        dictManual(manualKey) = True
+        rsManual.MoveNext
+    Loop
+    rsManual.Close
+    Set rsManual = Nothing
+    
+    
+    DBEngine.BeginTrans
     
     ' 2. Для каждого назначения получаем часы работы
     Do Until rsAssignments.EOF
+         ' Вычисление фактической начальной даты (MAX из трех дат)
         actualStart = IIf(StartDate > rsAssignments!ДатаНачала, StartDate, rsAssignments!ДатаНачала)
         actualStart = IIf(actualStart > rsAssignments!ДатаНачДолжности, actualStart, rsAssignments!ДатаНачДолжности)
+        ' Вычисление фактической конечной даты (MIN из трех дат)
         actualEnd = IIf(EndDate < rsAssignments!ДатаОкончания, EndDate, rsAssignments!ДатаОкончания)
         actualEnd = IIf(actualEnd < rsAssignments!ДатаОкончДолжности, actualEnd, rsAssignments!ДатаОкончДолжности)
         If actualStart <= actualEnd Then
@@ -85,14 +110,14 @@ Public Sub TEST_FillTimesheetForPeriod(ID_Период As Long, StartDate As Dat
         End If
         
         ' 4. Заполняем табель только для дней действия назначения
-        If Not (rsSchedule Is Nothing) And Not (rsSchedule.EOF And rsSchedule.BOF) Then
+        If Not (rsSchedule Is Nothing) And Not (rsSchedule.EOF And rsSchedule.BOF) Then  '  And Not (rsSchedule.EOF And rsSchedule.BOF)  добавил 24.10.2025
             Do Until rsSchedule.EOF
                 absenceCode = ""
                 
                 ' Проверяем отпуск
                 rsAbsenceAll.Filter = "ID_Персонал = " & rsAssignments!ID_Персонал & _
-                                        " AND Нач <= #" & Format(rsSchedule!WorkDate, "mm/dd/yyyy") & "# " & _
-                                        " AND Кон >= #" & Format(rsSchedule!WorkDate, "mm/dd/yyyy") & "#"
+                                        " AND Нач <= #" & Format(rsSchedule!WorkDate, "\#mm\/dd\/yyyy\#") & "# " & _
+                                        " AND Кон >= #" & Format(rsSchedule!WorkDate, "\#mm\/dd\/yyyy\#") & "#"
                 Set rsCheck = rsAbsenceAll.OpenRecordset() ' Это мгновенно (In-Memory)
                 
                 If Not rsCheck.EOF Then
@@ -106,42 +131,49 @@ Public Sub TEST_FillTimesheetForPeriod(ID_Период As Long, StartDate As Dat
                 
                 ' Формируем значение для табеля
                 If absenceCode <> "" Then
-                    hoursValue = "'" & absenceCode & "'" 
-                    hoursKode = "NULL" 
+                    hoursValue = "'" & absenceCode & "'" ' Код отсутствия в кавычках
+                    hoursKode = "NULL" ' 17/02/2026 для расчета Зарплаты
                 Else
                     If IsNull(rsSchedule!ЧАСЫ) Then
                       hoursValue = "NULL"
-                      hoursKode = "NULL" 
+                      hoursKode = "NULL" ' 17/02/2026 для расчета Зарплаты
                     Else
                        hoursValue = "'" & rsSchedule!ЧАСЫ & "'"
-                       hoursKode = "'" & rsSchedule!КОД_ЗП & "'" 
+                       hoursKode = "'" & rsSchedule!КОД_ЗП & "'" ' 17/02/2026 для расчета Зарплаты
                     End If
                 End If
                                 
-                If DCount("*", "тТАБЕЛЬ", "ID_Персонал = " & rsAssignments!ID_Персонал & _
-                                " AND Дата_Табель = # " & Format(rsSchedule!WorkDate, "yyyy-mm-dd") & _
-                                " # AND Nz(РучноеИзменение, False)  = True") = 0 Then '  ##########################   02/09/2025 If DCount....Then
-                    
+
+                ' Вместо DCount("*", "тТАБЕЛЬ", ...) пишем:
+                manualKey = rsAssignments!ID_Персонал & "-" & Format(rsSchedule!WorkDate, "yyyy-mm-dd")
+'                If DCount("*", "тТАБЕЛЬ", "ID_Персонал = " & rsAssignments!ID_Персонал & _
+'                                " AND Дата_Табель = # " & Format(rsSchedule!WorkDate, "yyyy-mm-dd") & _
+'                                " # AND Nz(РучноеИзменение, False)  = True") = 0 Then '  ##########################   02/09/2025 If DCount....Then
+                If Not dictManual.Exists(manualKey) Then
+                
+                    ' если в переводке в комментарии "работа в выходной день", то поставим галочку в поле [работа в выходной день] -> потребуется в доплатах
                     работаВвыходной = False
                     работаВвыходной = (Nz(rsAssignments!Причина, "") Like "*вых*")
                     
                     Dim итогоВыходной As Long
                     итогоВыходной = работаВвыходной
                     
+                    ' если это график 5/2 (ID=1) нужно указать часы работы,т.к. в графике их нет. '  ##########################   03/03/2026 ЭТО ЧТОБ С ТАБЕЛЕ ПРОСТАВЛЯЛИСЬ ЧАСЫ ДЛЯ РАБОТЫ В ВЫХОДНЫЕ
+                    ' пусть будет hoursValue = 10 часов чтоб бросалось в глаза
                      If rsAssignments!ID_ГрафикРаботы = 1 And итогоВыходной Then
                        hoursValue = "'10'"
                        hoursKode = "'У'"
                        итогоВыходной = CLng(работаВвыходной Or этоВыходной)
-                     End If                    
+                     End If
                     
 '                    ' Вставляем запись
+                    ' 17/02/2026 для расчета Зарплаты добавлено значение Код_Табель ("У","Н")
                     sql = "INSERT INTO тТАБЕЛЬ (ID_Персонал, ID_Период, ID_Штат, Дата_Табель, Часы_Табель, Код_Табель, ID_ГрафикРаботы, Работа_в_выходной, Работа_в_праздник) " & _
                           "VALUES (" & rsAssignments!ID_Персонал & ", " & ID_Период & ", " & rsAssignments!ID_Штат & ", " & _
                           "#" & Format(rsSchedule!WorkDate, "yyyy-mm-dd") & "#, " & hoursValue & ", " & hoursKode & ", " & rsAssignments!ID_ГрафикРаботы & ", " & итогоВыходной & ", " & этоПраздник & ")"
-'ПОКА ПРОСТО СМОТРЮ РЕЗУЛЬТАТ
 Debug.Print sql
 '                    db.Execute sql, dbFailOnError
-                End If 
+                End If '  ##########################   02/09/2025
                 rsSchedule.MoveNext
             Loop
         End If
@@ -155,6 +187,7 @@ Debug.Print sql
     Loop
     
     rsAssignments.Close
+    DBEngine.CommitTrans
     
     MsgBox "Табель заполнен!", vbInformation
     Exit Sub
@@ -164,13 +197,20 @@ CleanUp:
     If Not rsAssignments Is Nothing Then rsAssignments.Close
     If Not rsSchedule Is Nothing Then rsSchedule.Close
     If Not rsAbsence Is Nothing Then rsAbsence.Close
+    If Not dictHolidays Is Nothing Then rs.Close
+    
     Set rsAbsence = Nothing
     Set rsSchedule = Nothing
     Set rsAssignments = Nothing
+    Set dictHolidays = Nothing
     Set db = Nothing
     Exit Sub
     
 ErrorHandler:
+    ' Если транзакция была открыта, ее НУЖНО откатить при ошибке
+    ' Проверяем, активна ли транзакция (опционально, но лучше через флаг или просто Rollback)
+    On Error Resume Next ' Чтобы сам Rollback не вызвал ошибку, если транзакция не успела открыться
+    DBEngine.Rollback
     MsgBox "Ошибка в функции заполнения табеля: " & Err.Description & _
            vbCrLf & "Строка: " & Erl, vbCritical
     Resume CleanUp
